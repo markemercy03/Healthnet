@@ -14,6 +14,12 @@
 (define-constant ERR_INSUFFICIENT_INVENTORY (err u112))
 (define-constant ERR_SUPPLIER_NOT_REGISTERED (err u113))
 (define-constant ERR_INVALID_QUANTITY (err u114))
+(define-constant ERR_INVALID_METRIC_VALUE (err u115))
+(define-constant ERR_REGION_NOT_FOUND (err u116))
+(define-constant ERR_METRIC_NOT_FOUND (err u117))
+(define-constant ERR_ALREADY_CLAIMED (err u118))
+(define-constant ERR_TARGET_NOT_MET (err u119))
+(define-constant ERR_INVALID_TIMEFRAME (err u120))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var treasury-balance uint u0)
@@ -21,6 +27,9 @@
 (define-data-var voting-period uint u1440)
 (define-data-var next-shipment-id uint u1)
 (define-data-var next-supply-item-id uint u1)
+(define-data-var next-metric-report-id uint u1)
+(define-data-var reward-per-improvement uint u50000)
+(define-data-var current-reporting-period uint u1)
 
 (define-map members principal uint)
 (define-map proposals uint {
@@ -72,6 +81,36 @@
     notes: (string-ascii 200)
 })
 (define-map inventory {item-id: uint, holder: principal} uint)
+(define-map community-regions (string-ascii 50) {
+    name: (string-ascii 50),
+    population: uint,
+    active: bool,
+    registered-at: uint
+})
+(define-map health-metrics {region: (string-ascii 50), metric-type: (string-ascii 30), period: uint} {
+    value: uint,
+    target: uint,
+    reporter: principal,
+    verified: bool,
+    reported-at: uint
+})
+(define-map metric-reports uint {
+    id: uint,
+    region: (string-ascii 50),
+    metric-type: (string-ascii 30),
+    value: uint,
+    period: uint,
+    reporter: principal,
+    reported-at: uint,
+    verified: bool
+})
+(define-map improvement-rewards {region: (string-ascii 50), period: uint} {
+    claimed: bool,
+    reward-amount: uint,
+    improvement-score: uint,
+    claimer: principal
+})
+(define-map metric-targets (string-ascii 30) uint)
 
 (define-public (join-dao (stake-amount uint))
     (begin
@@ -460,3 +499,194 @@
 (define-read-only (get-next-supply-item-id)
     (var-get next-supply-item-id)
 )
+
+(define-public (register-community-region 
+    (region-id (string-ascii 50))
+    (population uint)
+)
+    (let (
+        (member-data (unwrap! (map-get? members tx-sender) ERR_NOT_MEMBER))
+    )
+        (asserts! (> population u0) ERR_INVALID_AMOUNT)
+        (map-set community-regions region-id {
+            name: region-id,
+            population: population,
+            active: true,
+            registered-at: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-public (set-metric-target 
+    (metric-type (string-ascii 30))
+    (target-value uint)
+)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> target-value u0) ERR_INVALID_METRIC_VALUE)
+        (map-set metric-targets metric-type target-value)
+        (ok true)
+    )
+)
+
+(define-public (submit-health-metric 
+    (region (string-ascii 50))
+    (metric-type (string-ascii 30))
+    (value uint)
+)
+    (let (
+        (report-id (var-get next-metric-report-id))
+        (current-period (var-get current-reporting-period))
+        (worker-data (unwrap! (map-get? health-workers tx-sender) ERR_UNAUTHORIZED))
+        (region-data (unwrap! (map-get? community-regions region) ERR_REGION_NOT_FOUND))
+        (target (default-to u0 (map-get? metric-targets metric-type)))
+    )
+        (asserts! (get certified worker-data) ERR_UNAUTHORIZED)
+        (asserts! (> value u0) ERR_INVALID_METRIC_VALUE)
+        (map-set metric-reports report-id {
+            id: report-id,
+            region: region,
+            metric-type: metric-type,
+            value: value,
+            period: current-period,
+            reporter: tx-sender,
+            reported-at: stacks-block-height,
+            verified: false
+        })
+        (map-set health-metrics {region: region, metric-type: metric-type, period: current-period} {
+            value: value,
+            target: target,
+            reporter: tx-sender,
+            verified: false,
+            reported-at: stacks-block-height
+        })
+        (var-set next-metric-report-id (+ report-id u1))
+        (ok report-id)
+    )
+)
+
+(define-public (verify-health-metric (report-id uint))
+    (let (
+        (report (unwrap! (map-get? metric-reports report-id) ERR_METRIC_NOT_FOUND))
+        (verifier-member (unwrap! (map-get? members tx-sender) ERR_NOT_MEMBER))
+    )
+        (asserts! (not (get verified report)) ERR_ALREADY_VERIFIED)
+        (map-set metric-reports report-id (merge report {verified: true}))
+        (map-set health-metrics 
+            {region: (get region report), metric-type: (get metric-type report), period: (get period report)}
+            (merge (unwrap! (map-get? health-metrics 
+                {region: (get region report), metric-type: (get metric-type report), period: (get period report)}) 
+                ERR_METRIC_NOT_FOUND) {verified: true}))
+        (ok true)
+    )
+)
+
+(define-public (calculate-improvement-score 
+    (region (string-ascii 50))
+    (period uint)
+)
+    (let (
+        (previous-period (- period u1))
+        (current-vaccination-data (map-get? health-metrics {region: region, metric-type: "vaccination-rate", period: period}))
+        (previous-vaccination-data (map-get? health-metrics {region: region, metric-type: "vaccination-rate", period: previous-period}))
+        (current-mortality-data (map-get? health-metrics {region: region, metric-type: "infant-mortality", period: period}))
+        (previous-mortality-data (map-get? health-metrics {region: region, metric-type: "infant-mortality", period: previous-period}))
+        (current-vaccination (match current-vaccination-data some-data (get value some-data) u0))
+        (previous-vaccination (match previous-vaccination-data some-data (get value some-data) u0))
+        (current-mortality (match current-mortality-data some-data (get value some-data) u0))
+        (previous-mortality (match previous-mortality-data some-data (get value some-data) u0))
+        (vaccination-improvement (if (> current-vaccination previous-vaccination) 
+                                   (- current-vaccination previous-vaccination) u0))
+        (mortality-improvement (if (< current-mortality previous-mortality) 
+                                 (- previous-mortality current-mortality) u0))
+        (total-score (+ vaccination-improvement mortality-improvement))
+    )
+        (asserts! (> period u1) ERR_INVALID_TIMEFRAME)
+        (map-set improvement-rewards {region: region, period: period} {
+            claimed: false,
+            reward-amount: (* total-score (var-get reward-per-improvement)),
+            improvement-score: total-score,
+            claimer: tx-sender
+        })
+        (ok total-score)
+    )
+)
+
+(define-public (claim-improvement-reward 
+    (region (string-ascii 50))
+    (period uint)
+)
+    (let (
+        (reward-data (unwrap! (map-get? improvement-rewards {region: region, period: period}) ERR_METRIC_NOT_FOUND))
+        (worker-data (unwrap! (map-get? health-workers tx-sender) ERR_UNAUTHORIZED))
+    )
+        (asserts! (not (get claimed reward-data)) ERR_ALREADY_CLAIMED)
+        (asserts! (> (get improvement-score reward-data) u0) ERR_TARGET_NOT_MET)
+        (asserts! (get certified worker-data) ERR_UNAUTHORIZED)
+        (asserts! (<= (get reward-amount reward-data) (var-get treasury-balance)) ERR_INSUFFICIENT_FUNDS)
+        (try! (stx-transfer? (get reward-amount reward-data) (as-contract tx-sender) tx-sender))
+        (var-set treasury-balance (- (var-get treasury-balance) (get reward-amount reward-data)))
+        (map-set improvement-rewards {region: region, period: period} 
+                 (merge reward-data {claimed: true}))
+        (ok (get reward-amount reward-data))
+    )
+)
+
+(define-public (advance-reporting-period)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set current-reporting-period (+ (var-get current-reporting-period) u1))
+        (ok (var-get current-reporting-period))
+    )
+)
+
+(define-public (update-reward-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-rate u0) ERR_INVALID_AMOUNT)
+        (var-set reward-per-improvement new-rate)
+        (ok true)
+    )
+)
+
+(define-read-only (get-community-region (region-id (string-ascii 50)))
+    (map-get? community-regions region-id)
+)
+
+(define-read-only (get-health-metric 
+    (region (string-ascii 50))
+    (metric-type (string-ascii 30))
+    (period uint)
+)
+    (map-get? health-metrics {region: region, metric-type: metric-type, period: period})
+)
+
+(define-read-only (get-metric-report (report-id uint))
+    (map-get? metric-reports report-id)
+)
+
+(define-read-only (get-improvement-reward 
+    (region (string-ascii 50))
+    (period uint)
+)
+    (map-get? improvement-rewards {region: region, period: period})
+)
+
+(define-read-only (get-metric-target (metric-type (string-ascii 30)))
+    (map-get? metric-targets metric-type)
+)
+
+(define-read-only (get-current-reporting-period)
+    (var-get current-reporting-period)
+)
+
+(define-read-only (get-reward-per-improvement)
+    (var-get reward-per-improvement)
+)
+
+(define-read-only (get-next-metric-report-id)
+    (var-get next-metric-report-id)
+)
+
+
