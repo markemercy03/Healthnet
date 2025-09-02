@@ -20,6 +20,8 @@
 (define-constant ERR_ALREADY_CLAIMED (err u118))
 (define-constant ERR_TARGET_NOT_MET (err u119))
 (define-constant ERR_INVALID_TIMEFRAME (err u120))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u121))
+(define-constant ERR_REPUTATION_COOLDOWN (err u122))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var treasury-balance uint u0)
@@ -111,6 +113,14 @@
     claimer: principal
 })
 (define-map metric-targets (string-ascii 30) uint)
+(define-map worker-reputation principal {
+    reputation-score: uint,
+    metrics-submitted: uint,
+    verifications-completed: uint,
+    contributions-score: uint,
+    last-activity: uint,
+    reputation-level: (string-ascii 20)
+})
 
 (define-public (join-dao (stake-amount uint))
     (begin
@@ -561,6 +571,7 @@
             verified: false,
             reported-at: stacks-block-height
         })
+        (unwrap! (update-worker-reputation-on-metric-submission tx-sender) (err u300))
         (var-set next-metric-report-id (+ report-id u1))
         (ok report-id)
     )
@@ -689,4 +700,114 @@
     (var-get next-metric-report-id)
 )
 
+;; === HEALTH WORKER REPUTATION SYSTEM ===
+
+(define-private (update-worker-reputation-on-metric-submission (worker principal))
+    (let (
+        (current-rep (default-to {reputation-score: u50, metrics-submitted: u0, verifications-completed: u0, contributions-score: u0, last-activity: u0, reputation-level: "beginner"} 
+                                 (map-get? worker-reputation worker)))
+        (new-metrics-count (+ (get metrics-submitted current-rep) u1))
+        (reputation-boost u5)
+        (new-reputation (+ (get reputation-score current-rep) reputation-boost))
+        (new-level (calculate-reputation-level new-reputation))
+    )
+        (map-set worker-reputation worker {
+            reputation-score: new-reputation,
+            metrics-submitted: new-metrics-count,
+            verifications-completed: (get verifications-completed current-rep),
+            contributions-score: (+ (get contributions-score current-rep) reputation-boost),
+            last-activity: stacks-block-height,
+            reputation-level: new-level
+        })
+        (ok true)
+    )
+)
+
+(define-private (update-worker-reputation-on-verification (verifier principal))
+    (let (
+        (current-rep (default-to {reputation-score: u50, metrics-submitted: u0, verifications-completed: u0, contributions-score: u0, last-activity: u0, reputation-level: "beginner"} 
+                                 (map-get? worker-reputation verifier)))
+        (new-verifications-count (+ (get verifications-completed current-rep) u1))
+        (reputation-boost u3)
+        (new-reputation (+ (get reputation-score current-rep) reputation-boost))
+        (new-level (calculate-reputation-level new-reputation))
+    )
+        (map-set worker-reputation verifier {
+            reputation-score: new-reputation,
+            metrics-submitted: (get metrics-submitted current-rep),
+            verifications-completed: new-verifications-count,
+            contributions-score: (+ (get contributions-score current-rep) reputation-boost),
+            last-activity: stacks-block-height,
+            reputation-level: new-level
+        })
+        (ok true)
+    )
+)
+
+(define-private (calculate-reputation-level (reputation-score uint))
+    (if (<= reputation-score u25) "beginner"
+        (if (<= reputation-score u75) "contributor"
+            (if (<= reputation-score u150) "expert"
+                (if (<= reputation-score u300) "master"
+                    "champion"
+                )
+            )
+        )
+    )
+)
+
+(define-public (claim-reputation-bonus)
+    (let (
+        (worker-data (unwrap! (map-get? health-workers tx-sender) ERR_UNAUTHORIZED))
+        (reputation-data (unwrap! (map-get? worker-reputation tx-sender) ERR_UNAUTHORIZED))
+        (reputation-score (get reputation-score reputation-data))
+        (last-activity (get last-activity reputation-data))
+        (blocks-since-activity (- stacks-block-height last-activity))
+        (bonus-amount (* reputation-score u1000))
+    )
+        (asserts! (get certified worker-data) ERR_UNAUTHORIZED)
+        (asserts! (>= reputation-score u100) ERR_INSUFFICIENT_REPUTATION)
+        (asserts! (>= blocks-since-activity u1440) ERR_REPUTATION_COOLDOWN) ;; 10 days cooldown
+        (asserts! (<= bonus-amount (var-get treasury-balance)) ERR_INSUFFICIENT_FUNDS)
+        (try! (stx-transfer? bonus-amount (as-contract tx-sender) tx-sender))
+        (var-set treasury-balance (- (var-get treasury-balance) bonus-amount))
+        (map-set worker-reputation tx-sender (merge reputation-data {last-activity: stacks-block-height}))
+        (ok bonus-amount)
+    )
+)
+
+(define-public (verify-health-metric-with-reputation (report-id uint))
+    (let (
+        (report (unwrap! (map-get? metric-reports report-id) ERR_METRIC_NOT_FOUND))
+        (verifier-member (unwrap! (map-get? members tx-sender) ERR_NOT_MEMBER))
+    )
+        (asserts! (not (get verified report)) ERR_ALREADY_VERIFIED)
+        (map-set metric-reports report-id (merge report {verified: true}))
+        (map-set health-metrics 
+            {region: (get region report), metric-type: (get metric-type report), period: (get period report)}
+            (merge (unwrap! (map-get? health-metrics 
+                {region: (get region report), metric-type: (get metric-type report), period: (get period report)}) 
+                ERR_METRIC_NOT_FOUND) {verified: true}))
+        (unwrap! (update-worker-reputation-on-verification tx-sender) (err u301))
+        (ok true)
+    )
+)
+
+(define-read-only (get-worker-reputation (worker principal))
+    (map-get? worker-reputation worker)
+)
+
+(define-read-only (get-reputation-level (worker principal))
+    (match (map-get? worker-reputation worker)
+        rep-data (get reputation-level rep-data)
+        "unranked"
+    )
+)
+
+(define-read-only (calculate-reputation-bonus (worker principal))
+    (match (map-get? worker-reputation worker)
+        rep-data (* (get reputation-score rep-data) u1000)
+        u0
+    )
+)
 

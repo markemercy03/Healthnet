@@ -106,6 +106,40 @@ Stake minimum 1 STX (1,000,000 microSTX) to become a voting member.
 
 MIT License - see LICENSE file for details.
 
+## 🏆 Health Worker Reputation System
+
+The Healthnet DAO includes a comprehensive reputation system for health workers that tracks and rewards their contributions to the platform.
+
+### Features
+
+- **Reputation Scoring**: Workers earn points for submitting health metrics (+5 points) and verifying reports (+3 points)
+- **Level Progression**: Five reputation levels based on scores:
+  - Beginner: 0-25 points
+  - Contributor: 26-75 points
+  - Expert: 76-150 points
+  - Master: 151-300 points
+  - Champion: 300+ points
+- **Bonus Rewards**: Workers with 100+ reputation can claim periodic bonuses (1000 STX per reputation point)
+- **Activity Tracking**: Monitors metrics submitted, verifications completed, and last activity
+
+### Functions
+
+#### Public Functions
+- `claim-reputation-bonus()` - Claim periodic STX bonus based on reputation (requires 100+ reputation, 10-day cooldown)
+- `verify-health-metric-with-reputation(report-id)` - Verify metrics while earning reputation points
+
+#### Read-Only Functions
+- `get-worker-reputation(worker)` - Get complete reputation data for a worker
+- `get-reputation-level(worker)` - Get the reputation level string for a worker
+- `calculate-reputation-bonus(worker)` - Calculate potential bonus amount for a worker
+
+### Integration
+
+The reputation system is seamlessly integrated into existing workflows:
+- Health metric submissions automatically update worker reputation
+- Metric verification through the new reputation-aware function grants verifier reputation points
+- Reputation bonuses provide long-term incentives for consistent participation
+
 ---
 
 *Empowering health workers through decentralized funding* 🌍💙
